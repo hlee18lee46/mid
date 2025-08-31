@@ -1,10 +1,24 @@
-export async function buildTDustTransferTx({ to, amount }: { to: string; amount: string }) {
-  const WalletSdk: any = await import("@midnight-ntwrk/wallet");
-  console.log("Wallet SDK exports:", Object.keys(WalletSdk));
-  const build =
-    WalletSdk.createTransferTransaction ||
-    WalletSdk.buildTransfer ||
-    WalletSdk.transfer;
-  if (!build) throw new Error("No transfer builder found in @midnight-ntwrk/wallet.");
-  return await build({ network: "testnet", asset: "tDUST", to, amount });
+import type { TokenType } from "@midnight-ntwrk/wallet-api";
+
+// small helper constant for type-safety
+const TDUST = "TDust" as TokenType;
+
+export async function buildTDustTransferTx({
+  to,
+  amount,
+}: {
+  to: string;
+  amount: string;
+}) {
+  const transfers = [
+    {
+      amount: BigInt(amount),    // bigint, must be integer
+      receiverAddress: to,       // "mn_shield-addr_..."
+      type: TDUST,               // ✅ use our constant, not TokenType.TDust
+    },
+  ];
+
+  // ⚠️ don’t call Transaction.transfer — not exported in wallet-api
+  // Instead, just return the array, since the wallet API accepts it:
+  return transfers;
 }

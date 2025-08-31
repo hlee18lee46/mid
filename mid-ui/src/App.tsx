@@ -1,14 +1,281 @@
+// App.tsx
 import { useEffect, useState } from "react";
 import { connectMidnight } from "./wallet";
-import { buildTDustTransferTx } from "./tx";
-import type { DAppConnectorAPI } from "./wallet"; // type-only import
+import type { DAppConnectorAPI } from "./wallet";
+import {
+  NetworkId,
+  UnprovenOffer,
+  UnprovenOutput,
+  UnprovenTransaction,
+  ProofErasedTransaction,
+  SecretKeys,
+  LocalState,
+  createCoinInfo,
+  nativeToken,
+  type QualifiedCoinInfo,
+} from "@midnight-ntwrk/ledger";
+async function demoModeSendTDust(recipientCPK: string, recipientEPK: string, amount: bigint): Promise<string> {
+  const outInfo = createCoinInfo(nativeToken(), amount);
+  const out = UnprovenOutput.new(outInfo, 0, recipientCPK, recipientEPK);
+  const guaranteed = UnprovenOffer.fromOutput(out, nativeToken(), outInfo.value);
+  const utx = new UnprovenTransaction(guaranteed);
+  const pr: ProofErasedTransaction = utx.eraseProofs();
+  const ids = pr.identifiers();
+  if (ids?.length) return String(ids[0]);
+  const bytes = pr.serialize(NetworkId.TestNet);
+  return "demo_" + Array.from(bytes).slice(0, 24).map(b => b.toString(16).padStart(2,"0")).join("");
+}
+
+/**
+ * Build a proof-erased tDUST transfer (no on-chain submission here).
+ * @param qcoin  A spendable coin: { type, nonce, value, mt_index }
+ * @param recipientCpk  mn_shield-cpk_...
+ * @param recipientEpk  mn_shield-epk_...
+ * @param amount        bigint
+ */
+export function buildProofErasedTDustTransfer(
+  qcoin: QualifiedCoinInfo,
+  recipientCpk: string,
+  recipientEpk: string,
+  amount: bigint
+): { pr: ProofErasedTransaction; bytes: Uint8Array } {
+  // 1) Make an UnprovenInput for a *user-owned* coin using LocalState.spend
+  //    (We use demo keys here just to satisfy the API; wallet would normally supply keys.)
+  const demoSeed = new Uint8Array(32);
+  const sk = SecretKeys.fromSeed(demoSeed);
+  let local = new LocalState();
+  const [, ui] = local.spend(sk, qcoin, /*segment*/ 0);
+
+  // 2) Create the recipient output
+  const outInfo = createCoinInfo(nativeToken(), amount);
+  const out = UnprovenOutput.new(outInfo, 0, recipientCpk, recipientEpk);
+
+  // 3) Assemble guaranteed offer (input -> output), plus change back to sender (ignoring fees here)
+  let guaranteed = UnprovenOffer
+    .fromInput(ui, nativeToken(), qcoin.value)
+    .merge(UnprovenOffer.fromOutput(out, nativeToken(), outInfo.value));
+
+  const change = qcoin.value - outInfo.value; // NOTE: not fee-adjusted in this mock
+  if (change > 0n) {
+    const changeInfo = createCoinInfo(nativeToken(), change);
+    const changeOut = UnprovenOutput.new(changeInfo, 1, sk.coinPublicKey, sk.encryptionPublicKey);
+    guaranteed = guaranteed.merge(UnprovenOffer.fromOutput(changeOut, nativeToken(), changeInfo.value));
+  }
+
+  // 4) Wrap → erase proofs → serialize for TestNet
+  const utx = new UnprovenTransaction(guaranteed);
+  const pr: ProofErasedTransaction = utx.eraseProofs();
+  const bytes = pr.serialize(NetworkId.TestNet);
+  return { pr, bytes };
+}
+
+/* -------------------------------------------------------
+   Provider discovery: prefer mnLace, then lace, else first
+------------------------------------------------------- */
+function getProvider(): any | null {
+  const root = (window as any)?.midnight;
+  if (!root || typeof root !== "object") return null;
+  if (root.mnLace) return root.mnLace;
+  if (root.lace) return root.lace;
+  const key = Object.keys(root).find(k => root[k] && typeof root[k] === "object");
+  return key ? root[key] : null;
+}
+
+async function requireWallet(): Promise<any> {
+  const w = getProvider();
+  if (!w) throw new Error("Wallet not injected. Open Lace (Midnight test profile) and reload.");
+  if (typeof w.enable === "function") {
+    try { await w.enable(); } catch {}
+  }
+  return w;
+}
+
+/* -------------------------------------------------------
+   PATH A — High-level transfer via wallet (no coin list)
+   (balanceAndProveTransaction → submitTransaction)
+------------------------------------------------------- */
+async function walletTransferTDust(receiverAddress: string, amount: bigint): Promise<string> {
+  const w = await requireWallet();
+  if (typeof (w as any).balanceAndProveTransaction !== "function" ||
+      typeof (w as any).submitTransaction !== "function") {
+    throw new Error("High-level transfer API not available on this wallet.");
+  }
+
+  const transfers = [{ amount, receiverAddress, type: "TDust" as any }];
+
+  // Some wallets accept just the result object; others need a nested field.
+  const res = await (w as any).balanceAndProveTransaction({ transfers });
+
+  const candidates = [
+    res,
+    res?.transaction,
+    res?.tx,
+    res?.value,
+    res?.provenTransaction,
+    res?.signed,
+    res?.signedTx,
+    res?.payload,
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    try {
+      const id = await (w as any).submitTransaction(c);
+      if (id) return String(id);
+    } catch {
+      // try next candidate
+    }
+  }
+  throw new Error("Wallet submitTransaction returned no tx id.");
+}
+
+/* -------------------------------------------------------
+   PATH B — Low-level ledger offer (needs coins list)
+   (UnprovenOffer → UnprovenTransaction.eraseProofs → serialize)
+------------------------------------------------------- */
+function toBigIntSafe(x: any): bigint | null {
+  if (typeof x === "bigint") return x;
+  if (typeof x === "number" && Number.isFinite(x)) return BigInt(Math.trunc(x));
+  if (typeof x === "string" && /^-?\d+$/.test(x.trim())) return BigInt(x.trim());
+  return null;
+}
+
+function normalizeQCoin(o: any): QualifiedCoinInfo | null {
+  if (!o || typeof o !== "object") return null;
+  const type = o.type ?? o.token ?? o.tokenType ?? o.color ?? o.asset ?? null;
+  const nonce = o.nonce ?? o.randomness ?? o.rand ?? null;
+  const value = toBigIntSafe(o.value ?? o.amount ?? o.balance ?? o.quantity);
+  const mt_index = toBigIntSafe(
+    o.mt_index ?? o.mtIndex ?? o.merkleIndex ?? o.index ?? o.treeIndex ?? (("idx" in o) ? o.idx : undefined)
+  );
+  if (typeof type === "string" && typeof nonce === "string" && value != null && mt_index != null) {
+    return { type, nonce, value, mt_index };
+  }
+  return null;
+}
+
+function extractQualifiedCoinsFrom(anyObj: any): QualifiedCoinInfo[] {
+  const out: QualifiedCoinInfo[] = [];
+  const seen = new Set<any>();
+  const stack: any[] = [anyObj];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (!cur || typeof cur !== "object" || seen.has(cur)) continue;
+    seen.add(cur);
+    const asQ = normalizeQCoin(cur);
+    if (asQ) out.push(asQ);
+    if (Array.isArray(cur)) { for (const it of cur) stack.push(it); continue; }
+    for (const v of Object.values(cur)) stack.push(v);
+  }
+  const key = (c: QualifiedCoinInfo) => `${c.type}|${c.nonce}|${c.value}|${c.mt_index}`;
+  return Array.from(new Map(out.map(c => [key(c), c])).values());
+}
+
+async function walletListCoins(): Promise<QualifiedCoinInfo[]> {
+  const w = await requireWallet();
+
+  if (typeof w.listCoins === "function") return (await w.listCoins()) as QualifiedCoinInfo[];
+  if (typeof w.getUtxos === "function") return (await w.getUtxos()) as QualifiedCoinInfo[];
+  if (typeof w.coins === "function") return (await w.coins()) as QualifiedCoinInfo[];
+
+  // Fallback: mine from state / serializeState
+  let stateObj: any = null;
+  try {
+    if (typeof w.serializeState === "function") {
+      const s = await w.serializeState();
+      try { stateObj = JSON.parse(s); } catch {}
+    }
+    if (!stateObj && typeof w.state === "function") {
+      const st = await w.state();
+      stateObj = st?.state ?? st ?? null;
+    }
+  } catch {}
+
+  if (stateObj) {
+    const mined = extractQualifiedCoinsFrom(stateObj);
+    if (mined.length) return mined;
+  }
+
+  throw new Error("NO_COIN_ENUM");
+}
+
+async function ledgerOfferTDust(recipientCpkHex: string, recipientEpkHex: string, amount: bigint): Promise<string> {
+  const coins = await walletListCoins(); // may throw NO_COIN_ENUM
+  if (!coins.length) throw new Error("No spendable coins. Use faucet for tDUST.");
+
+  const coin = coins.find(c => c.value >= amount) || coins[0];
+
+  const dummySeed = new Uint8Array(32); // demo keys; your wallet should supply keys for real change outputs
+  const sk = SecretKeys.fromSeed(dummySeed);
+  let local = new LocalState();
+  const [/*local2*/, unprovenInput] = local.spend(sk, coin, 0);
+
+  const { UnprovenOutput } = await import("@midnight-ntwrk/ledger");
+  const outInfo = createCoinInfo(nativeToken(), amount);
+  const out = UnprovenOutput.new(outInfo, 0, recipientCpkHex, recipientEpkHex);
+
+  let guaranteed = UnprovenOffer
+    .fromInput(unprovenInput, nativeToken(), coin.value)
+    .merge(UnprovenOffer.fromOutput(out, nativeToken(), outInfo.value));
+
+  const change = coin.value - outInfo.value; // NOTE: does not subtract fees for brevity
+  if (change > 0n) {
+    const changeInfo = createCoinInfo(nativeToken(), change);
+    const changeOut = UnprovenOutput.new(changeInfo, 1, sk.coinPublicKey, sk.encryptionPublicKey);
+    guaranteed = guaranteed.merge(UnprovenOffer.fromOutput(changeOut, nativeToken(), changeInfo.value));
+  }
+
+  const utx = new UnprovenTransaction(guaranteed);
+  const proofErased: ProofErasedTransaction = utx.eraseProofs();
+  const bytes = proofErased.serialize(NetworkId.TestNet);
+
+  const w = await requireWallet();
+  if (typeof w.signAndSubmitTx === "function") return await w.signAndSubmitTx(bytes);
+  if (typeof w.submitTransaction === "function") {
+    try { return await w.submitTransaction(bytes); }
+    catch { return await w.submitTransaction({ serialize: () => bytes }); }
+  }
+  throw new Error("Wallet lacks sign/submit (signAndSubmitTx/submitTransaction).");
+}
+
+/* -------------------------------------------------------
+   UI helpers
+------------------------------------------------------- */
+function safeStringify(x: any): string {
+  try { return JSON.stringify(x, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2); }
+  catch { try { return String(x); } catch { return ""; } }
+}
+
+function deriveAddressFromState(state: any): string {
+  if (!state) return "";
+  return state?.addresses?.[0] || state?.address || state?.account?.address || "";
+}
+
+function deriveTDustBalanceFromState(state: any): string {
+  if (!state) return "";
+  if (state?.balances?.tDUST != null) return String(state.balances.tDUST);
+  const arrays: any[] = [];
+  if (Array.isArray(state?.assets)) arrays.push(state.assets);
+  if (Array.isArray(state?.balances)) arrays.push(state.balances);
+  if (Array.isArray(state?.coins)) arrays.push(state.coins);
+  for (const arr of arrays) {
+    const hit = arr.find((x: any) =>
+      x?.asset === "tDUST" || x?.ticker === "tDUST" || x?.symbol === "tDUST" || x?.denom === "tDUST"
+    );
+    if (hit?.amount != null) return String(hit.amount);
+    if (hit?.balance != null) return String(hit.balance);
+  }
+  try {
+    const m = JSON.stringify(state).match(/"tDUST"\s*:\s*"?([\d.]+)"/i);
+    if (m?.[1]) return m[1];
+  } catch {}
+  return "";
+}
 
 function MidnightDebug() {
   const [keys, setKeys] = useState<string[] | null>(null);
   useEffect(() => {
     const m = (window as any)?.midnight;
-    const k = m ? Object.keys(m) : null;
-    setKeys(k);
+    setKeys(m ? Object.keys(m) : null);
     console.log("window.midnight =", m);
   }, []);
   return (
@@ -18,39 +285,9 @@ function MidnightDebug() {
   );
 }
 
-// Heuristic to derive an address from wallet state so UI can show something
-function deriveAddressFromState(state: any): string {
-  if (!state) return "";
-  return state?.addresses?.[0] || state?.address || state?.account?.address || "";
-}
-
-// Robust tDUST extractor: scans common shapes + nested arrays
-function deriveTDustBalanceFromState(state: any): string {
-  if (!state) return "";
-  if (state?.balances?.tDUST != null) return String(state.balances.tDUST);
-  const arrays: any[] = [];
-  if (Array.isArray(state?.assets)) arrays.push(state.assets);
-  if (Array.isArray(state?.balances)) arrays.push(state.balances);
-  if (Array.isArray(state?.coins)) arrays.push(state.coins);
-  for (const arr of arrays) {
-    const hit = arr.find(
-      (x: any) =>
-        x?.asset === "tDUST" ||
-        x?.ticker === "tDUST" ||
-        x?.symbol === "tDUST" ||
-        x?.denom === "tDUST"
-    );
-    if (hit?.amount != null) return String(hit.amount);
-    if (hit?.balance != null) return String(hit.balance);
-  }
-  try {
-    const json = JSON.stringify(state);
-    const m = json.match(/"tDUST"\s*:\s*"?([\d.]+)"/i);
-    if (m?.[1]) return m[1];
-  } catch {}
-  return "";
-}
-
+/* -------------------------------------------------------
+   Component
+------------------------------------------------------- */
 export default function App() {
   const [api, setApi] = useState<DAppConnectorAPI | null>(null);
   const [providerName, setProviderName] = useState("");
@@ -61,15 +298,21 @@ export default function App() {
   const [addr, setAddr] = useState("");
   const [balance, setBalance] = useState<string>("");
 
-  const [recipient, setRecipient] = useState("");
-  const [amount, setAmount] = useState("1.0");
+  // Inputs for Mode A (wallet transfer)
+  const [recipientAddr, setRecipientAddr] = useState("");
+  // Inputs for Mode B (ledger offer)
+  const [recipientCPK, setRecipientCPK] = useState("");
+  const [recipientEPK, setRecipientEPK] = useState("");
+
+  const [amount, setAmount] = useState("1");
   const [sending, setSending] = useState(false);
   const [lastTxId, setLastTxId] = useState("");
 
-  // ⬇️ these two hooks belong INSIDE the component
+  // Which mode is available? (auto-detected)
+  const [canWalletTransfer, setCanWalletTransfer] = useState<boolean | null>(null);
+  const [canCoinEnum, setCanCoinEnum] = useState<boolean | null>(null);
+
   const [lastStateJson, setLastStateJson] = useState<string>("");
-  const [indexerMsg, setIndexerMsg] = useState<string>("");
-  const [indexerOverride, setIndexerOverride] = useState<string>("");
 
   async function handleConnect() {
     try {
@@ -79,272 +322,85 @@ export default function App() {
       setWalletName(walletName || "");
       setApiVersion(apiVersion || "");
       setServiceUris(serviceUris || null);
-      console.log("serviceUriConfig =", serviceUris); // 👈 see what fields exist
-
-      console.log("wallet state (on connect) =", state);
       setLastStateJson(JSON.stringify(state, null, 2));
       setAddr(deriveAddressFromState(state));
       setBalance(deriveTDustBalanceFromState(state));
+
+      // detect capabilities
+      const w = await requireWallet();
+      setCanWalletTransfer(typeof w.balanceAndProveTransaction === "function" &&
+                           typeof w.submitTransaction === "function");
+      setCanCoinEnum(typeof w.listCoins === "function" ||
+                     typeof w.getUtxos === "function" ||
+                     typeof w.coins === "function" ||
+                     typeof w.serializeState === "function" ||
+                     typeof w.state === "function");
     } catch (e: any) {
       alert(e.message || String(e));
     }
   }
 
-async function refreshBalance() {
-  if (!api) return;
-  try {
-    const state = await api.state();
-    setLastStateJson(JSON.stringify(state, null, 2));
-    setBalance(deriveTDustBalanceFromState(state) || "");
-    if (!addr) setAddr(deriveAddressFromState(state));
-    await queryIndexerForTDust(); // NEW
-  } catch (e) {
-    console.error(e);
-    alert("Failed to refresh balance (see console).");
-  }
-}
-
-
-function getIndexerBase(): string | null {
-  const fromOverride = (indexerOverride || "").trim();
-  const fromWallet =
-    (serviceUris?.indexerUrl as string) ||
-    (serviceUris?.indexerUri as string) || // GraphQL from Lace
-    (serviceUris?.indexer as string) ||
-    "";
-  const base = (fromOverride || fromWallet).replace(/\/+$/, "");
-  return base || null;
-}
-
-
-async function queryIndexerForTDust() {
-  const base = getIndexerBase();
-  if (!base) return setIndexerMsg("No indexer URL. Paste one below or configure Lace to expose it.");
-  if (!addr) return setIndexerMsg("No address to query yet.");
-
-  // Helper to recognize GraphQL endpoints
-  const isGraphQL = /\/graphql(\b|\/|$)/i.test(base);
-
-  setIndexerMsg(isGraphQL ? "Querying indexer (GraphQL)..." : "Querying indexer (REST)...");
-
-  // --- Common helper to pick an amount from any object that represents tDUST
-  const isTDUST = (o: any) =>
-    o?.asset === "tDUST" ||
-    o?.symbol === "tDUST" ||
-    o?.ticker === "tDUST" ||
-    o?.denom === "tDUST" ||
-    o?.unit === "tDUST" ||
-    o?.name === "tDUST";
-
-  const pickAmount = (o: any): string | null => {
-    if (!o || typeof o !== "object") return null;
-    const v = o.amount ?? o.quantity ?? o.balance ?? o.value ?? null;
-    return v != null ? String(v) : null;
-  };
-
-  const scanPayload = (data: any): string | null => {
-    if (!data) return null;
-
-    // keyed map: { balances: { tDUST: "123" } }
-    if (data?.balances?.tDUST != null) return String(data.balances.tDUST);
-
-    // arrays in common keys
-    for (const key of ["balances", "assets", "coins", "portfolio", "utxos", "items"]) {
-      const arr = data?.[key];
-      if (Array.isArray(arr)) {
-        for (const it of arr) {
-          if (isTDUST(it)) {
-            const v = pickAmount(it);
-            if (v) return v;
-          }
-          // nested assets in UTXO-like shapes
-          const nested = it?.assets || it?.tokens || it?.outputs;
-          if (Array.isArray(nested)) {
-            for (const t of nested) {
-              if (isTDUST(t)) {
-                const v = pickAmount(t);
-                if (v) return v;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // top-level array (UTXOs)
-    if (Array.isArray(data)) {
-      for (const utxo of data) {
-        const assets = utxo?.assets || utxo?.tokens || utxo?.outputs || [];
-        if (Array.isArray(assets)) {
-          for (const t of assets) {
-            if (isTDUST(t)) {
-              const v = pickAmount(t);
-              if (v) return v;
-            }
-          }
-        }
-      }
-    }
-
-    // last-resort regex
+  async function refreshBalance() {
     try {
-      const text = JSON.stringify(data);
-      const m =
-        text.match(/"tDUST"\s*:\s*"?([\d.]+)"/i) ||
-        text.match(/"amount"\s*:\s*"?([\d.]+)".{0,80}"(asset|symbol|ticker|unit|denom|name)":"tDUST"/i);
-      if (m?.[1]) return m[1];
-    } catch {}
-    return null;
-  };
-
-  try {
-    if (isGraphQL) {
-      // ---- GraphQL mode
-      const endpoint = base.replace(/\/+$/, "");
-      const queries = [
-        {
-          // balances array
-          q: `
-            query Balances($a: String!) {
-              balances(address: $a) {
-                asset
-                symbol
-                ticker
-                denom
-                unit
-                amount
-                quantity
-              }
-            }
-          `,
-          pick: (d: any) => d?.balances,
-        },
-        {
-          // address -> balances + utxos
-          q: `
-            query AddressBalances($a: String!) {
-              address(address: $a) {
-                balances {
-                  asset
-                  symbol
-                  ticker
-                  denom
-                  unit
-                  amount
-                  quantity
-                }
-                utxos {
-                  assets {
-                    asset
-                    symbol
-                    ticker
-                    denom
-                    unit
-                    amount
-                    quantity
-                  }
-                }
-              }
-            }
-          `,
-          pick: (d: any) => d?.address?.balances || d?.address?.utxos,
-        },
-      ];
-
-      for (const { q, pick } of queries) {
-        const r = await fetch(endpoint, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ query: q, variables: { a: addr } }),
-        });
-        if (!r.ok) continue;
-        const body = await r.json();
-        if (body?.errors?.length) continue;
-
-        const payload = pick(body?.data || {});
-        const v = scanPayload(payload);
-        if (v) {
-          setBalance(v);
-          setIndexerMsg("Found via GraphQL indexer.");
-          return;
-        }
+      const w = await requireWallet();
+      if (typeof w.serializeState === "function") {
+        const s = await w.serializeState();
+        const parsed = JSON.parse(s);
+        const root = parsed?.state ?? parsed;
+        setLastStateJson(safeStringify(root));
+        if (!addr) setAddr(root?.address || "");
+        if (root?.balances?.TDust != null) setBalance(String(root.balances.TDust));
+        else setBalance(deriveTDustBalanceFromState(root));
+      } else if (typeof w.state === "function") {
+        const st = await w.state();
+        setLastStateJson(safeStringify(st));
+        if (!addr) setAddr(deriveAddressFromState(st));
+        setBalance(deriveTDustBalanceFromState(st));
       }
-
-      setIndexerMsg("GraphQL indexer responded, but no tDUST found. Use faucet, then retry.");
-      return;
-    } else {
-      // ---- REST mode
-      const a = addr;
-      const candidates = [
-        `${base}/v1/address/${encodeURIComponent(a)}/balances`,
-        `${base}/v1/accounts/${encodeURIComponent(a)}/balances`,
-        `${base}/v1/address/${encodeURIComponent(a)}/assets`,
-        `${base}/v1/address/${encodeURIComponent(a)}/utxos`,
-        `${base}/balances?address=${encodeURIComponent(a)}`,
-        `${base}/assets?address=${encodeURIComponent(a)}`,
-        `${base}/utxos?address=${encodeURIComponent(a)}`,
-      ];
-
-      for (const url of candidates) {
-        try {
-          const r = await fetch(url, { mode: "cors" });
-          if (!r.ok) continue;
-          const data = await r.json();
-          const v = scanPayload(data);
-          if (v) {
-            setBalance(v);
-            setIndexerMsg(`Found via REST indexer: ${url}`);
-            return;
-          }
-        } catch {
-          // try next
-        }
-      }
-      setIndexerMsg("REST indexer queried, but no tDUST found. Use faucet, then retry.");
-      return;
+    } catch (e) {
+      console.error("refreshBalance error:", e);
     }
-  } catch (e: any) {
-    setIndexerMsg(`Indexer error: ${e?.message || String(e)}`);
   }
-}
 
-
-
-
-  async function sendTDust() {
-    if (!api) return alert("Connect the wallet first.");
-    if (!recipient) return alert("Enter recipient address.");
-    if (!amount) return alert("Enter amount.");
-
+  async function onSendTDust() {
     setSending(true);
     setLastTxId("");
-
     try {
-      const tx = await buildTDustTransferTx({ to: recipient, amount });
-      const balancedAndProven = await api.balanceAndProveTransaction(tx);
-      const submitted = await api.submitTransaction(balancedAndProven);
-      console.log("submitted =", submitted);
+      const amt = BigInt(amount.trim());
+      const w = await requireWallet();
+      const supportsWalletTransfer = typeof w.balanceAndProveTransaction === "function" &&
+                                     typeof w.submitTransaction === "function";
 
-      const txId =
-        submitted?.txId ||
-        submitted?.transactionId ||
-        submitted?.hash ||
-        JSON.stringify(submitted);
-      setLastTxId(String(txId));
+      // Prefer high-level wallet transfer if available
+      if (supportsWalletTransfer) {
+        if (!/^mn_/.test(recipientAddr)) {
+          throw new Error("Recipient must be a Midnight shield address (mn_...) for wallet transfer mode.");
+        }
+        const txId = await walletTransferTDust(recipientAddr, amt);
+        setLastTxId(txId);
+        alert(`Submitted (wallet transfer). Tx: ${txId}`);
+        return;
+      }
 
-      await refreshBalance();
-      alert(`Submitted! Tx: ${txId}`);
+      // Fallback to ledger-offer mode (needs CPK + EPK)
+      if (!/^mn_/.test(recipientCPK) || !/^mn_/.test(recipientEPK)) {
+        throw new Error("Recipient CPK/EPK required (mn_shield-cpk_..., mn_shield-epk_...) for ledger-offer mode.");
+      }
+      const txId = await ledgerOfferTDust(recipientCPK, recipientEPK, amt);
+      setLastTxId(txId);
+      alert(`Submitted (ledger offer). Tx: ${txId}`);
     } catch (e: any) {
       console.error(e);
-      if (String(e.message || e).includes("Missing Midnight transaction builder")) {
-        alert("Install the Midnight wallet SDK and make buildTDustTransferTx(...) return a real Transaction.");
-      } else {
-        alert(`Send failed: ${e?.message || String(e)}`);
-      }
+      alert(`Send failed: ${e?.message || String(e)}`);
     } finally {
       setSending(false);
     }
   }
+
+  useEffect(() => {
+    const m = (window as any)?.midnight;
+    console.log("window.midnight =", m, "keys=", m ? Object.keys(m) : []);
+  }, []);
 
   return (
     <div style={{ padding: 24, maxWidth: 860, margin: "0 auto" }}>
@@ -352,48 +408,74 @@ async function queryIndexerForTDust() {
 
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
         <button onClick={handleConnect}>Connect Wallet (Midnight)</button>
-        <button onClick={refreshBalance} disabled={!api}>Refresh Balance</button>
+        <button onClick={refreshBalance}>Refresh Balance</button>
         <button
-          onClick={async () => console.log("wallet state (manual dump) =", await api?.state())}
-          disabled={!api}
+          onClick={async () => {
+            try { console.log("wallet state:", await (await requireWallet()).state?.()); }
+            catch (e) { console.log("wallet state() unavailable", e); }
+          }}
         >
           Dump state to console
         </button>
-        <button onClick={queryIndexerForTDust} disabled={!serviceUris || !addr}>
-          Query Indexer for tDUST
-        </button>
-        {indexerMsg && <span style={{ opacity: 0.8 }}>{indexerMsg}</span>}
       </div>
 
       <div style={{ marginTop: 12 }}>
-        <p>Provider key: {providerName || "—"}</p>
-        <p>Wallet name: {walletName || "—"}</p>
+        <p>Provider: {providerName || "(auto-detected)"}</p>
+        <p>Wallet: {walletName || "—"}</p>
         <p>API version: {apiVersion || "—"}</p>
-        <p>Service URIs: {serviceUris ? "loaded" : "—"}</p>
-        <p>Address: {addr || "—"}</p>
+        <p>Address (heuristic): {addr || "—"}</p>
         <p>tDUST Balance: {balance !== "" ? balance : "—"}</p>
-        <p>
-  Service URIs:
-  <code style={{ display: "block", whiteSpace: "pre-wrap" }}>
-    {serviceUris ? JSON.stringify(serviceUris, null, 2) : "—"}
-  </code>
-</p>
-<div style={{ marginTop: 8, display: "grid", gap: 6, maxWidth: 720 }}>
-  <label>
-    Indexer URL override (optional):
-    <input
-      placeholder="https://<public-midnight-indexer>/..."
-      value={indexerOverride}
-      onChange={(e) => setIndexerOverride(e.target.value)}
-      style={{ width: "100%" }}
-    />
-  </label>
-  <small style={{ opacity: 0.8 }}>
-    If Lace doesn’t expose an indexer URL, paste one here and click “Query Indexer for tDUST”.
-  </small>
-</div>
-
+        <p>Capabilities: walletTransfer={String(canWalletTransfer)} coinEnum={String(canCoinEnum)}</p>
       </div>
+
+      <hr style={{ margin: "16px 0" }} />
+
+      <h3>Send tDUST</h3>
+
+      {/* Mode A: wallet transfer (preferred when available) */}
+      <fieldset style={{ border: "1px solid #444", padding: 12, marginBottom: 12 }}>
+        <legend>Mode A — Wallet Transfer (uses shield address)</legend>
+        <div style={{ display: "grid", gap: 8, maxWidth: 520 }}>
+          <input
+            placeholder="Recipient shield address (mn_...)"
+            value={recipientAddr}
+            onChange={(e) => setRecipientAddr(e.target.value)}
+          />
+          <input
+            placeholder="Amount (e.g., 5)"
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+          />
+          <button onClick={onSendTDust} disabled={sending}>
+            {sending ? "Sending…" : "Send tDUST"}
+          </button>
+          {lastTxId && (
+            <p style={{ wordBreak: "break-all" }}>
+              Last tx id/hash: <code>{lastTxId}</code>
+            </p>
+          )}
+        </div>
+        <small style={{ opacity: 0.8 }}>
+          If your wallet doesn’t expose the high-level transfer API, the app will fall back to Mode B.
+        </small>
+      </fieldset>
+
+      {/* Mode B: ledger offer (requires CPK+EPK) */}
+      <fieldset style={{ border: "1px dashed #666", padding: 12 }}>
+        <legend>Mode B — Ledger Offer (uses CPK + EPK)</legend>
+        <div style={{ display: "grid", gap: 8, maxWidth: 520 }}>
+          <input
+            placeholder="Recipient Coin Public Key (mn_shield-cpk_...)"
+            value={recipientCPK}
+            onChange={(e) => setRecipientCPK(e.target.value)}
+          />
+          <input
+            placeholder="Recipient Encryption Public Key (mn_shield-epk_...)"
+            value={recipientEPK}
+            onChange={(e) => setRecipientEPK(e.target.value)}
+          />
+        </div>
+      </fieldset>
 
       {lastStateJson && (
         <details style={{ marginTop: 12 }}>
@@ -403,30 +485,6 @@ async function queryIndexerForTDust() {
           </pre>
         </details>
       )}
-
-      <hr style={{ margin: "16px 0" }} />
-
-      <h3>Send tDUST</h3>
-      <div style={{ display: "grid", gap: 8, maxWidth: 520 }}>
-        <input
-          placeholder="Recipient address (mn_shield-addr_...)"
-          value={recipient}
-          onChange={(e) => setRecipient(e.target.value)}
-        />
-        <input
-          placeholder="Amount (e.g., 5)"
-          value={amount}
-          onChange={(e) => setAmount(e.target.value)}
-        />
-        <button onClick={sendTDust} disabled={!api || sending}>
-          {sending ? "Sending…" : "Send tDUST"}
-        </button>
-        {lastTxId && (
-          <p style={{ wordBreak: "break-all" }}>
-            Last tx id/hash: <code>{lastTxId}</code>
-          </p>
-        )}
-      </div>
 
       <MidnightDebug />
     </div>

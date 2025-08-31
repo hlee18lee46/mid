@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@midnight-ntwrk/wallet": "^5.0.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "walletconnect": "^1.7.8"
