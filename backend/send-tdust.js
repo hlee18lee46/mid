@@ -20,7 +20,7 @@ const {
   SEED,
   MNEMONIC,
   TO_ADDR,
-  AMOUNT_NAT = '1',
+  AMOUNT_NAT = '1000000',
   LOG_LEVEL = 'warn'
 } = process.env;
 
