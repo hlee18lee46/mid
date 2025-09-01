@@ -14,6 +14,10 @@ import {
   nativeToken,
   type QualifiedCoinInfo,
 } from "@midnight-ntwrk/ledger";
+
+import { sendTDustWithLocalWallet } from "./sendWithLocalWallet";
+
+
 async function demoModeSendTDust(recipientCPK: string, recipientEPK: string, amount: bigint): Promise<string> {
   const outInfo = createCoinInfo(nativeToken(), amount);
   const out = UnprovenOutput.new(outInfo, 0, recipientCPK, recipientEPK);
